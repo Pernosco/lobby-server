@@ -1,0 +1,385 @@
+#!/usr/bin/env python3
+import argparse
+import base64
+import enum
+import glob
+import http.server
+import json
+import logging
+import os
+import random
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+from typing import Dict, List, NewType, Optional, Tuple
+import watchdog
+from watchdog import events, observers
+
+import pernoscoshared.base as base
+
+ContainerId = NewType("ContainerId", str)
+TraceId = NewType("TraceId", str)
+ImageName = NewType("ImageName", str)
+
+# Setup Pernosco style logging output.
+Pid = NewType('Pid', int)
+Tid = NewType('Tid', int)
+
+pid_tid_storage = threading.local()
+def pid_tid() -> Tuple[Pid, Tid]:
+    if not getattr(pid_tid_storage, 'initialized', None):
+        pid = os.getpid()
+        tid = threading.get_native_id()
+        pid_tid_storage.value = (pid, tid)
+        pid_tid_storage.initialized = True
+    return pid_tid_storage.value
+
+def pid_tid_filter(record):
+    (pid, tid) = pid_tid()
+    record.pid = pid
+    record.tid = tid
+    return record
+
+pid_tid_handler = logging.StreamHandler()
+pid_tid_handler.addFilter(pid_tid_filter)
+logging.basicConfig(level=logging.INFO,
+                    handlers=[pid_tid_handler],
+                    format='%(levelname)s:%(name)s:%(pid)d.%(tid)d:%(created)10.7f: %(message)s')
+
+process_setup_logger = logging.getLogger("process_setup")
+process_setup_logger.info("Process started: %s"%" ".join(sys.argv))
+
+random.seed()
+
+# Now start actually doing stuff.
+
+arg_parser = argparse.ArgumentParser(add_help=False)
+arg_subparsers = arg_parser.add_subparsers(dest='subcommand', title='Subcommands')
+global_opts_group = arg_parser.add_argument_group("Global Options")
+global_opts_group.add_argument("-h", "--help", action='help', help="Show this help message and exit")
+global_opts_group.add_argument("-x", dest='echo_commands', action='store_true', help="Echo spawned command lines")
+global_opts_group.add_argument("--log", help="(debug|info|warn|error) sets logging to the given level.")
+global_opts_group.add_argument("--container-runtime", help="Set docker or podman as the runtime (use podman at your own risk!)", default="docker")
+global_opts_group.add_argument("--gcloud", action='store_true', help="Use containers from Google Cloud Artifact Registry instead of AWS")
+
+run_subparser = arg_subparsers.add_parser("run", help="Run the lobby-server.")
+run_subparser.add_argument("--storage", help="Use this directory to store persistent data (i.e. notebook data)")
+run_subparser.add_argument("dir", help="The directory in which rr traces can be found")
+
+args = arg_parser.parse_args()
+
+base.echo_commands = args.echo_commands
+
+if args.log:
+    logging.getLogger(None).setLevel(args.log.upper())
+
+if args.gcloud:
+    REPOSITORY_REGION = 'us-west1'
+    REPOSITORY_HOST = '%s-docker.pkg.dev'%REPOSITORY_REGION
+    STATIC_HOST = 'http://pernosco-statics.s3-website-us-west-1.amazonaws.com'
+    SERVER_REPOSITORY = '%s/pernosco/customers/app-server'%REPOSITORY_HOST
+    REVERSE_PROXY_REPOSITORY = '%s/pernosco/customers/reverse-proxy'%REPOSITORY_HOST
+else:
+    REPOSITORY_REGION = 'us-east-2'
+    REPOSITORY_HOST = '643334553517.dkr.ecr.%s.amazonaws.com'%REPOSITORY_REGION
+    STATIC_HOST = 'http://pernosco-statics.s3-website-us-west-1.amazonaws.com'
+    SERVER_REPOSITORY = '%s/customers/app-server'%REPOSITORY_HOST
+    REVERSE_PROXY_REPOSITORY = '%s/customers/reverse-proxy'%REPOSITORY_HOST
+
+metadata = {
+    'revision': 'a2015f125b8be24e9e69cd0f9964fdb839c745ec',
+}
+
+SERVER_IMAGE = ImageName("%s:%s"%(SERVER_REPOSITORY, metadata['revision']))
+REVERSE_PROXY_IMAGE = ImageName("%s:%s"%(REVERSE_PROXY_REPOSITORY, metadata['revision']))
+STATIC_PREFIX = "%s/client/%s"%(STATIC_HOST, metadata['revision'])
+
+def start_container(image: ImageName, name: str, params: List[str], detach: bool = True,
+                    needs_all_syscalls: bool = False, network_mode_host: bool = False,
+                    env: Dict[str, str] = {}, read_write_mounts: List[Tuple[str, str]] = [],
+                    read_only_mounts: List[Tuple[str, str]] = [],
+                    labels: List[Tuple[str, str]] = []) -> ContainerId:
+    cmd = [args.container_runtime, 'run', '--name',
+           "%s-%s"%(name, hex(random.randrange(pow(2,64)))[2:]), '--tmpfs', '/tmp',
+           '--env', 'RUST_BACKTRACE=full', '--init']
+    if detach:
+        cmd.extend(['--detach'])
+    if needs_all_syscalls:
+        # app server containers need exotic kernel features like ptrace
+        # and user namespaces, so these confinements need to be disabled.
+        cmd.extend(['--security-opt', 'seccomp=unconfined',
+                    '--security-opt', 'apparmor=unconfined'])
+    if network_mode_host:
+        cmd.extend(['--network', 'host'])
+    for e in env:
+        cmd.extend(['--env', "%s=%s"%(e, env[e])])
+    for mount in read_write_mounts:
+        cmd.extend(['--mount', 'type=bind,bind-propagation=rslave,src=%s,dst=%s'%mount])
+    for mount in read_only_mounts:
+        cmd.extend(['--mount', 'type=bind,bind-propagation=rslave,readonly,src=%s,dst=%s'%mount])
+    for label in labels:
+        cmd.extend(['--label', '%s=%s'%label])
+    cmd.append(image)
+    cmd.extend(params)
+
+    # Avoid using 'encoding' parameter to check_output because it was only
+    # added in Python 3.6.
+    return ContainerId(base.check_output(cmd).decode().strip())
+
+def stop_container(container_id: ContainerId) -> None:
+    base.call([args.container_runtime, 'stop', container_id], stdout=subprocess.DEVNULL)
+
+def cleanup_container(container_id: ContainerId) -> None:
+    base.check_call([args.container_runtime, 'rm', '--force', '--volumes', container_id], stdout=subprocess.DEVNULL)
+
+def start_appserver(uuid: TraceId, path: str, db_candidates: List[str],
+                    extra_arguments: List[str] = [],
+                    read_write_mounts: List[Tuple[str, str]] = []) -> ContainerId:
+    params = ['--empty-umask']
+    params.extend(extra_arguments)
+    read_only_mounts = [(path, "/pernosco/database")]
+    env = {'PERNOSCO_ENABLE_VARIABLES_ANNOTATIONS': '0',
+           'RUST_LOG': 'info'}
+    return start_container(SERVER_IMAGE, 'pernosco-%s'%uuid, params,
+                           needs_all_syscalls=True, env=env,
+                           read_only_mounts=read_only_mounts,
+                           read_write_mounts=read_write_mounts,
+                           labels=[('traefik.http.services.app-server-%s.loadbalancer.server.port'%uuid, '3000'),
+                                   ('traefik.http.routers.app-server-%s.service'%uuid, 'app-server-%s'%uuid),
+                                   ('traefik.http.routers.app-server-%s.priority'%uuid, '1000'),
+                                   ('traefik.http.routers.app-server-%s.rule'%uuid, 'PathPrefix(`/debug/%s/app`)'%uuid),
+                                   ('traefik.http.routers.app-server-%s.middlewares'%uuid, 'strip-app-server-prefix-%s'%uuid),
+                                   ('traefik.http.middlewares.strip-app-server-prefix-%s.stripprefix.prefixes'%uuid, '/debug/%s/app'%uuid)])
+
+@enum.unique
+class KnownHtml(enum.Enum):
+    INDEX = 1
+    SOURCE_VIEWER = 2
+
+    def __str__(self):
+        if self == KnownHtml.INDEX:
+            return "index"
+        if self == KnownHtml.SOURCE_VIEWER:
+            return "source-viewer"
+        raise ValueError("huh?")
+
+known_html_cache: Dict[TraceId, Dict[KnownHtml, bytes]] = {}
+auth_server: Optional[http.server.HTTPServer] = None
+
+def get_known_html(known_html: KnownHtml, trace_id: TraceId,
+                   containers: Dict[TraceId, ContainerId]) -> Optional[bytes]:
+    cache = known_html_cache.get(trace_id, {})
+    cached = cache.get(known_html)
+    if cached is None:
+        container_id = containers[trace_id]
+        if container_id == None:
+            return None
+
+        cached = base.check_output([args.container_runtime, 'exec', container_id, '/bin/bash', '-c', 'cat $PERNOSCO_ROOT/main/client/%s.html'%known_html], stdin=subprocess.DEVNULL)
+        # XXXkhuey these should not be hardcoded.
+        cached = cached.replace(b'%PROTOCOL%', b'2')
+        cached = cached.replace(b'%STATIC_PREFIX%', STATIC_PREFIX.encode('utf-8'))
+        cache[known_html] = cached
+    return cached
+
+def apply_known_html_headers(known_html: KnownHtml, response: http.server.BaseHTTPRequestHandler):
+    if known_html == KnownHtml.SOURCE_VIEWER:
+        frame_ancestors = '\'self\''
+        frame_options = 'SAMEORIGIN'
+    else:
+        frame_ancestors = '\'none\''
+        frame_options = 'DENY'
+
+    # Build our CSP.
+    # XXXkhuey Hosted Pernosco contains a CSP workaround for
+    # https://bugs.webkit.org/show_bug.cgi?id=201591. Do we need that here?
+    csp = f"""
+default-src 'self';
+script-src 'self' 'sha256-ih8uGBHZhNa8RYX6VNKy3/buYTmJD3KJ+JyIRzUB4s4=' {STATIC_HOST};
+connect-src 'self';
+style-src 'self' 'unsafe-inline' {STATIC_HOST};
+img-src 'self' data: {STATIC_HOST};
+font-src 'self' {STATIC_HOST};
+child-src 'self' blob: {STATIC_HOST};
+frame-ancestors {frame_ancestors};
+base-uri 'none';
+object-src 'none';
+form-action 'none';
+"""
+    response.send_header('Content-Type', 'text/html; charset=utf-8')
+    # NB: the newlines above make the CSP human readable here but we can't
+    # send those over the wire.
+    response.send_header('Content-Security-Policy', csp.replace('\n', ' '))
+
+    # XXXkhuey STS?
+    response.send_header('X-Frame-Options', frame_options)
+    response.send_header('Referrer-Policy', 'strict-origin-when-cross-origin')
+    response.send_header('Cache-Control', 'private,must-revalidate')
+
+def run_command() -> None:
+    run_logger = logging.getLogger("run")
+    if not shutil.which('rr'):
+        print("Please install `rr` master and make sure it's on your $PATH.", file=sys.stderr)
+        sys.exit(1)
+
+    appserver_extra_arguments = []
+    appserver_read_write_mounts = []
+    if args.storage:
+        base.call(['chmod', '--quiet', '--recursive', 'ugo+rwX', args.storage])
+        appserver_extra_arguments.extend(["--app-storage", "/pernosco/storage"])
+        appserver_read_write_mounts.append((args.storage, "/pernosco/storage"))
+    else:
+        run_logger.warning("No --storage argument specified, persistent data will be lost.")
+        
+    run_logger.debug("Starting reverse proxy")
+    # Start traefik.
+    reverse_proxy_id = start_container(REVERSE_PROXY_IMAGE, "reverse-proxy", [],
+                                       network_mode_host=True,
+                                       read_write_mounts=[('/var/run/docker.sock', '/var/run/docker.sock')])
+    run_logger.debug("Reverse proxy up")
+
+    dir_provider_logger = logging.getLogger("dir_provider")
+    http_logger = logging.getLogger("http")
+    containers = {}
+    with os.scandir(args.dir) as it:
+        for entry in it:
+            # Filter out things that aren't valid-looking Pernosco traces.
+            # Toss anything that's not a directory.
+            if entry.is_file():
+                dir_provider_logger.debug("Ignoring non-directory %s"%entry.path)
+                continue
+
+            # See if we can find a candidate database directory.
+            db_candidates = glob.glob("db.*", root_dir=entry.path)
+            if not db_candidates:
+                dir_provider_logger.debug("Ignoring directory %s with no db candidates"%entry.path)
+                continue
+
+            # Since it looks like a Pernosco trace directory, go ahead and run
+            # rr traceinfo on it.
+            output = base.check_output(['rr', 'traceinfo', entry.path]).decode('utf-8')
+            trace_info = json.loads(output)
+            # Convert the trace UUID to urlsafe base64, but strip padding.
+            uuid = TraceId(base64.urlsafe_b64encode(bytes(trace_info['uuid']))[:-2].decode('utf-8'))
+            container = start_appserver(uuid, entry.path, db_candidates,
+                                        extra_arguments=appserver_extra_arguments,
+                                        read_write_mounts=appserver_read_write_mounts)
+            containers[uuid] = container
+            print("%s available at http://127.0.0.1:8080/debug/%s/index.html"%(entry.path, uuid))
+
+    run_logger.debug("Databases enumerated, starting watchdog")
+    class DatabaseEventHandler(watchdog.events.FileSystemEventHandler):
+        def on_created(self, event):
+            # NB: We can't actually check event.is_directory because
+            # this could be a symlink.
+            dir_provider_logger.debug("Observed file creation %s"%event.src_path)
+
+            # See if we can find a candidate database directory.
+            db_candidates = glob.glob("db.*", root_dir=event.src_path)
+            if not db_candidates:
+                dir_provider_logger.debug("Ignoring directory %s with no db candidates"%event.src_path)
+                return
+
+            # Since it looks like a Pernosco trace directory, go ahead and run
+            # rr traceinfo on it.
+            output = base.check_output(['rr', 'traceinfo', event.src_path]).decode('utf-8')
+            trace_info = json.loads(output)
+            # Convert the trace UUID to urlsafe base64, but strip padding.
+            uuid = TraceId(base64.urlsafe_b64encode(bytes(trace_info['uuid']))[:-2].decode('utf-8'))
+            container = start_appserver(uuid, event.src_path, db_candidates,
+                                        extra_arguments=appserver_extra_arguments,
+                                        read_write_mounts=appserver_read_write_mounts)
+            containers[uuid] = container
+            print("%s available at http://127.0.0.1:8080/debug/%s/index.html"%(event.src_path, uuid))
+            
+    observer = watchdog.observers.Observer()
+    observer.schedule(DatabaseEventHandler(), args.dir)
+    observer.start()
+
+    def serve_auth():
+        global auth_server
+        class AuthHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                # XXXkhuey do real authentication here according to customer needs.
+                self.send_response(200)
+                self.send_header('X-Pernosco-Authorized', 'true')
+                self.end_headers()
+
+        server_address = ('', 5001)
+        auth_server = http.server.HTTPServer(server_address, AuthHTTPRequestHandler)
+        auth_server.serve_forever()
+
+    run_logger.debug("Starting auth thread")
+    auth_thread = threading.Thread(name="auth_thread", target=serve_auth)
+    auth_thread.start()
+
+    try:
+        class LobbyHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                url_parts_regex = re.compile("^/debug/(?P<id>[-_a-zA-Z0-9]{22})/(?P<suffix>.*)")
+                matches = url_parts_regex.match(self.path.split('?')[0])
+                if not matches:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+
+                id = matches.group("id")
+                suffix = matches.group("suffix")
+
+                if suffix == "index.html":
+                    response = get_known_html(KnownHtml.INDEX, id, containers)
+                    if response == None:                        
+                        self.send_response(404)
+                        self.end_headers()
+                        return
+
+                    self.send_response(200)
+                    apply_known_html_headers(KnownHtml.INDEX, self)
+                    self.end_headers()
+                    self.wfile.write(response)
+                    return
+
+                if suffix == "source-viewer.html":
+                    response = get_known_html(KnownHtml.SOURCE_VIEWER, id, containers)
+                    if response == None:                        
+                        self.send_response(404)
+                        self.end_headers()
+                        return
+
+                    self.send_response(200)
+                    apply_known_html_headers(KnownHtml.SOURCE_VIEWER, self)
+                    self.end_headers()
+                    self.wfile.write(response)
+                    return
+
+                self.send_response(404)
+                self.end_headers()
+
+        server_address = ('', 5000)
+        run_logger.debug("Starting main HTTP server")
+        primary_server = http.server.ThreadingHTTPServer(server_address, LobbyHTTPRequestHandler)
+        primary_server.serve_forever()
+
+    except KeyboardInterrupt:
+        global auth_server
+        assert not auth_server is None
+        run_logger.debug("Interrupted, shutting down")
+        auth_server.shutdown()
+        auth_thread.join()
+
+    run_logger.debug("Shutting down app servers")
+    for container in containers.values():
+        stop_container(container)
+        cleanup_container(container)
+
+    run_logger.debug("Shutting down reverse proxy")
+    stop_container(reverse_proxy_id)
+    cleanup_container(reverse_proxy_id)
+
+if args.subcommand == "run":
+    run_command()
+else:
+    arg_parser.print_help()
