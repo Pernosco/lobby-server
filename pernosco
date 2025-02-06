@@ -68,6 +68,8 @@ global_opts_group.add_argument("--gcloud", action='store_true', help="Use contai
 run_subparser = arg_subparsers.add_parser("run", help="Run the lobby-server.")
 run_subparser.add_argument("--storage", help="Use this directory to store persistent data (i.e. notebook data)")
 run_subparser.add_argument("--url-root", help="The outwardly-visible URL for this server (e.g. https://pernos.co)")
+run_subparser.add_argument("--notify-gcp-pubsub-topic", help="The GCP Pub/Sub to send notifications to")
+run_subparser.add_argument("--notify-on-startup", action='store_true', help="Send a notification on startup")
 run_subparser.add_argument("dir", help="The directory in which rr traces can be found")
 
 args = arg_parser.parse_args()
@@ -91,7 +93,7 @@ else:
     REVERSE_PROXY_REPOSITORY = '%s/customers/reverse-proxy'%REPOSITORY_HOST
 
 metadata = {
-    'revision': 'a2015f125b8be24e9e69cd0f9964fdb839c745ec',
+    'revision': '3b29702b176e51691f1bb26d20013699b5fe60c5',
 }
 
 SERVER_IMAGE = ImageName("%s:%s"%(SERVER_REPOSITORY, metadata['revision']))
@@ -241,6 +243,11 @@ def run_command() -> None:
         appserver_read_write_mounts.append((args.storage, "/pernosco/storage"))
     else:
         run_logger.warning("No --storage argument specified, persistent data will be lost.")
+
+    if not args.notify_gcp_pubsub_topic is None:
+        appserver_extra_arguments.extend(['--notify-gcp-pubsub-topic', args.notify_gcp_pubsub_topic])
+    if args.notify_on_startup:
+        appserver_extra_arguments.extend(['--notify-gcp-pubsub-on-startup'])
         
     run_logger.debug("Starting reverse proxy")
     # Start traefik.
