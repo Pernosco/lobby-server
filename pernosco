@@ -66,6 +66,7 @@ global_opts_group.add_argument("--container-runtime", help="Set docker or podman
 global_opts_group.add_argument("--gcloud", action='store_true', help="Use containers from Google Cloud Artifact Registry instead of AWS")
 
 run_subparser = arg_subparsers.add_parser("run", help="Run the lobby-server.")
+run_subparser.add_argument("-p", "--port", type=int, default=8080, help="The port to serve Pernosco on. (default to 8080 if unspecified)")
 run_subparser.add_argument("--storage", help="Use this directory to store persistent data (i.e. notebook data)")
 run_subparser.add_argument("--url-root", help="The outwardly-visible URL for this server (e.g. https://pernos.co)")
 run_subparser.add_argument("--notify-gcp-pubsub-topic", help="The GCP Pub/Sub to send notifications to")
@@ -93,7 +94,7 @@ else:
     REVERSE_PROXY_REPOSITORY = '%s/customers/reverse-proxy'%REPOSITORY_HOST
 
 metadata = {
-    'revision': '3b29702b176e51691f1bb26d20013699b5fe60c5',
+    'revision': '7f1fff5da2e0d93d673733e049feb680e2f646ee',
 }
 
 SERVER_IMAGE = ImageName("%s:%s"%(SERVER_REPOSITORY, metadata['revision']))
@@ -138,7 +139,7 @@ def stop_container(container_id: ContainerId) -> None:
 def cleanup_container(container_id: ContainerId) -> None:
     base.check_call([args.container_runtime, 'rm', '--force', '--volumes', container_id], stdout=subprocess.DEVNULL)
 
-url_root: str = "http://127.0.0.1:8080"
+url_root: str = "http://127.0.0.1:%d"%args.port
 if not args.url_root is None:
     # Remove any trailing slash.
     url_root = args.url_root.removesuffix('/')
@@ -235,6 +236,11 @@ def run_command() -> None:
         print("Please install `rr` master and make sure it's on your $PATH.", file=sys.stderr)
         sys.exit(1)
 
+    reverse_proxy_params = ["--log.level=DEBUG",
+                            "--entryPoints.http.address=:%d"%args.port,
+                            "--providers.file.directory=/traefik-config",
+                            "--entryPoints.http.http.middlewares=auth@file",
+                            "--providers.docker.exposedbydefault=false"]
     appserver_extra_arguments = []
     appserver_read_write_mounts = []
     if args.storage:
@@ -251,7 +257,7 @@ def run_command() -> None:
         
     run_logger.debug("Starting reverse proxy")
     # Start traefik.
-    reverse_proxy_id = start_container(REVERSE_PROXY_IMAGE, "reverse-proxy", [],
+    reverse_proxy_id = start_container(REVERSE_PROXY_IMAGE, "reverse-proxy", reverse_proxy_params,
                                        network_mode_host=True,
                                        read_write_mounts=[('/var/run/docker.sock', '/var/run/docker.sock')])
     run_logger.debug("Reverse proxy up")
@@ -308,7 +314,7 @@ def run_command() -> None:
                                         extra_arguments=appserver_extra_arguments,
                                         read_write_mounts=appserver_read_write_mounts)
             containers[uuid] = container
-            print("%s available at %/debug/%s/index.html"%(event.src_path, url_root, uuid))
+            print("%s available at %s/debug/%s/index.html"%(event.src_path, url_root, uuid))
             
     observer = watchdog.observers.Observer()
     observer.schedule(DatabaseEventHandler(), args.dir)
