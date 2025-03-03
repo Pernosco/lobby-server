@@ -165,6 +165,37 @@ def start_appserver(uuid: TraceId, path: str, db_candidates: List[str],
                                    ('traefik.http.routers.app-server-%s.middlewares'%uuid, 'strip-app-server-prefix-%s'%uuid),
                                    ('traefik.http.middlewares.strip-app-server-prefix-%s.stripprefix.prefixes'%uuid, '/debug/%s/app'%uuid)])
 
+def process_one_dir(path: str, newly_added: bool = False,
+                    extra_arguments: List[str] = [],
+                    read_write_mounts: List[Tuple[str, str]] = []) -> Optional[Tuple[TraceId, ContainerId]]:
+    dir_provider_logger = logging.getLogger("dir_provider")
+
+    # See if we can find a candidate database directory.
+    db_candidates = glob.glob("db.*", root_dir=path)
+    if not db_candidates:
+        dir_provider_logger.debug("Ignoring directory %s with no db candidates"%path)
+        return None
+
+    # Since it looks like a Pernosco trace directory, go ahead and run
+    # rr traceinfo on it.
+    output = base.check_output(['rr', 'traceinfo', path]).decode('utf-8')
+    trace_info = json.loads(output)
+    # Convert the trace UUID to urlsafe base64, but strip padding.
+    uuid = TraceId(base64.urlsafe_b64encode(bytes(trace_info['uuid']))[:-2].decode('utf-8'))
+
+    if newly_added:
+        print("Would notify gcp")
+        if not args.notify_gcp_pubsub_topic is None:
+            extra_arguments.extend(['--notify-gcp-pubsub-topic', args.notify_gcp_pubsub_topic])
+        if args.notify_on_startup:
+            extra_arguments.extend(['--notify-gcp-pubsub-on-startup'])
+
+    container = start_appserver(uuid, path, db_candidates,
+                                extra_arguments=extra_arguments,
+                                read_write_mounts=read_write_mounts)
+    print("%s available at %s/debug/%s/index.html"%(path, url_root, uuid))
+    return (uuid, container)
+
 @enum.unique
 class KnownHtml(enum.Enum):
     INDEX = 1
@@ -249,11 +280,6 @@ def run_command() -> None:
         appserver_read_write_mounts.append((args.storage, "/pernosco/storage"))
     else:
         run_logger.warning("No --storage argument specified, persistent data will be lost.")
-
-    if not args.notify_gcp_pubsub_topic is None:
-        appserver_extra_arguments.extend(['--notify-gcp-pubsub-topic', args.notify_gcp_pubsub_topic])
-    if args.notify_on_startup:
-        appserver_extra_arguments.extend(['--notify-gcp-pubsub-on-startup'])
         
     run_logger.debug("Starting reverse proxy")
     # Start traefik.
@@ -273,23 +299,14 @@ def run_command() -> None:
                 dir_provider_logger.debug("Ignoring non-directory %s"%entry.path)
                 continue
 
-            # See if we can find a candidate database directory.
-            db_candidates = glob.glob("db.*", root_dir=entry.path)
-            if not db_candidates:
-                dir_provider_logger.debug("Ignoring directory %s with no db candidates"%entry.path)
+            result = process_one_dir(entry.path, newly_added=False,
+                                     extra_arguments=appserver_extra_arguments,
+                                     read_write_mounts=appserver_read_write_mounts)
+            if result is None:
                 continue
 
-            # Since it looks like a Pernosco trace directory, go ahead and run
-            # rr traceinfo on it.
-            output = base.check_output(['rr', 'traceinfo', entry.path]).decode('utf-8')
-            trace_info = json.loads(output)
-            # Convert the trace UUID to urlsafe base64, but strip padding.
-            uuid = TraceId(base64.urlsafe_b64encode(bytes(trace_info['uuid']))[:-2].decode('utf-8'))
-            container = start_appserver(uuid, entry.path, db_candidates,
-                                        extra_arguments=appserver_extra_arguments,
-                                        read_write_mounts=appserver_read_write_mounts)
-            containers[uuid] = container
-            print("%s available at %s/debug/%s/index.html"%(entry.path, url_root, uuid))
+            (uuid, container_id) = result
+            containers[uuid] = container_id
 
     run_logger.debug("Databases enumerated, starting watchdog")
     class DatabaseEventHandler(watchdog.events.FileSystemEventHandler):
@@ -298,23 +315,14 @@ def run_command() -> None:
             # this could be a symlink.
             dir_provider_logger.debug("Observed file creation %s"%event.src_path)
 
-            # See if we can find a candidate database directory.
-            db_candidates = glob.glob("db.*", root_dir=event.src_path)
-            if not db_candidates:
-                dir_provider_logger.debug("Ignoring directory %s with no db candidates"%event.src_path)
+            result = process_one_dir(event.src_path, newly_added=True,
+                                     extra_arguments=appserver_extra_arguments,
+                                     read_write_mounts=appserver_read_write_mounts)
+            if result is None:
                 return
 
-            # Since it looks like a Pernosco trace directory, go ahead and run
-            # rr traceinfo on it.
-            output = base.check_output(['rr', 'traceinfo', event.src_path]).decode('utf-8')
-            trace_info = json.loads(output)
-            # Convert the trace UUID to urlsafe base64, but strip padding.
-            uuid = TraceId(base64.urlsafe_b64encode(bytes(trace_info['uuid']))[:-2].decode('utf-8'))
-            container = start_appserver(uuid, event.src_path, db_candidates,
-                                        extra_arguments=appserver_extra_arguments,
-                                        read_write_mounts=appserver_read_write_mounts)
-            containers[uuid] = container
-            print("%s available at %s/debug/%s/index.html"%(event.src_path, url_root, uuid))
+            (uuid, container_id) = result
+            containers[uuid] = container_id
             
     observer = watchdog.observers.Observer()
     observer.schedule(DatabaseEventHandler(), args.dir)
