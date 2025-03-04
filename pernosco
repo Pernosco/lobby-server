@@ -291,6 +291,7 @@ def run_command() -> None:
     dir_provider_logger = logging.getLogger("dir_provider")
     http_logger = logging.getLogger("http")
     containers = {}
+    traces_by_dir = {}
     with os.scandir(args.dir) as it:
         for entry in it:
             # Filter out things that aren't valid-looking Pernosco traces.
@@ -307,6 +308,7 @@ def run_command() -> None:
 
             (uuid, container_id) = result
             containers[uuid] = container_id
+            traces_by_dir[entry.path] = uuid
 
     run_logger.debug("Databases enumerated, starting watchdog")
     class DatabaseEventHandler(watchdog.events.FileSystemEventHandler):
@@ -323,7 +325,21 @@ def run_command() -> None:
 
             (uuid, container_id) = result
             containers[uuid] = container_id
-            
+            traces_by_dir[event.src_path] = uuid
+
+        def on_deleted(self, event):
+            # NB: We can't actually check event.is_directory because
+            # this could be a symlink.
+            dir_provider_logger.debug("Observed file deletion %s"%event.src_path)
+
+            if event.src_path not in traces_by_dir:
+                return
+
+            uuid = traces_by_dir.pop(event.src_path)
+            container_id = containers.pop(uuid)
+            stop_container(container_id)
+            cleanup_container(container_id)
+
     observer = watchdog.observers.Observer()
     observer.schedule(DatabaseEventHandler(), args.dir)
     observer.start()
