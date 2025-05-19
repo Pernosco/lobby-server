@@ -94,7 +94,7 @@ else:
     REVERSE_PROXY_REPOSITORY = '%s/customers/reverse-proxy'%REPOSITORY_HOST
 
 metadata = {
-    'revision': '98b9c764afd78059430225883652597da3cdb5c2',
+    'revision': '7ddc63ca16a0f32b1202b8c6f8cb7abc86b30e1b',
 }
 
 SERVER_IMAGE = ImageName("%s:%s"%(SERVER_REPOSITORY, metadata['revision']))
